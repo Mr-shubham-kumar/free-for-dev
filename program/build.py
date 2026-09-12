@@ -11,18 +11,23 @@ import json
 import re
 import shutil
 import tempfile
+import zipfile
+import zlib
 from dataclasses import dataclass
+from xml.etree import ElementTree
 from pathlib import Path
 from urllib.parse import urlparse
 
 TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
 STRUCTURED_EXTENSIONS = {".csv", ".json", ".yaml", ".yml"}
-SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | STRUCTURED_EXTENSIONS
+DOCUMENT_EXTENSIONS = {".docx", ".pdf"}
+SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | STRUCTURED_EXTENSIONS | DOCUMENT_EXTENSIONS
 HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 MARKDOWN_RESOURCE_PATTERN = re.compile(
     r"^\s*(?:[-*+]|\d+[.)])\s+\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:[-–—:]\s*)?(.*)$"
 )
 TEXT_RESOURCE_PATTERN = re.compile(r"^\s*([^|]+?)\s*\|\s*(https?://[^|\s]+)\s*(?:\|\s*(.*))?$")
+DOCUMENT_RESOURCE_PATTERN = re.compile(r"^\s*(.+?)\s+[-–—]\s+(https?://\S+)\s*(?:[-–—]\s*(.*))?$")
 
 
 @dataclass(frozen=True)
@@ -180,6 +185,64 @@ def extract_structured_resources(
     return resources, warnings
 
 
+def document_lines(file: Path) -> list[str]:
+    if file.suffix.lower() == ".docx":
+        with zipfile.ZipFile(file) as document:
+            xml = ElementTree.fromstring(document.read("word/document.xml"))
+        namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        return ["".join(paragraph.itertext()) for paragraph in xml.iter(f"{namespace}p")]
+
+    raw_bytes = file.read_bytes()
+    text_streams = [raw_bytes.decode("latin-1", errors="ignore")]
+    for stream in re.findall(rb"stream\r?\n(.*?)\r?\nendstream", raw_bytes, re.DOTALL):
+        try:
+            text_streams.append(zlib.decompress(stream).decode("latin-1", errors="ignore"))
+        except zlib.error:
+            continue
+    return [
+        bytes(match.group(1), "latin-1").decode("unicode_escape", errors="ignore")
+        for text_stream in text_streams
+        for match in re.finditer(r"\(([^()]*)\)\s*Tj", text_stream)
+    ]
+
+
+def extract_document_resources(
+    file: Path, input_directory: Path
+) -> tuple[list[Resource], list[FileReport]]:
+    source_path = str(file.relative_to(input_directory)).replace("\\", "/")
+    resources: list[Resource] = []
+    warnings: list[FileReport] = []
+    for line_number, line in enumerate(document_lines(file), start=1):
+        match = TEXT_RESOURCE_PATTERN.match(line) or DOCUMENT_RESOURCE_PATTERN.match(line)
+        if not match:
+            continue
+        name, candidate_url, description = (part.strip() for part in match.groups(default=""))
+        location = f"{source_path}:{line_number}"
+        if not name:
+            warnings.append(FileReport(location, "Review", "Missing resource name; not published."))
+            continue
+        url = safe_url(candidate_url)
+        if not url:
+            warnings.append(FileReport(location, "Review", "Unsafe or invalid URL; not published."))
+            continue
+        if not description:
+            warnings.append(FileReport(location, "Review", "Missing description."))
+        warnings.append(FileReport(location, "Review", "Ambiguous classification: document entries have no heading category."))
+        resources.append(
+            Resource(
+                identifier=resource_identifier(name, source_path, line_number),
+                name=name,
+                url=url,
+                description=description,
+                category="Uncategorized",
+                tags=extract_tags(description),
+                source_path=source_path,
+                source_line=line_number,
+            )
+        )
+    return resources, warnings
+
+
 def extract_resources(file: Path, input_directory: Path) -> tuple[list[Resource], list[FileReport]]:
     source_path = str(file.relative_to(input_directory)).replace("\\", "/")
     category = "Uncategorized"
@@ -264,6 +327,8 @@ def import_resources(files: list[Path], input_directory: Path) -> tuple[list[Res
         try:
             if suffix in STRUCTURED_EXTENSIONS:
                 extracted, warnings = extract_structured_resources(file, input_directory)
+            elif suffix in DOCUMENT_EXTENSIONS:
+                extracted, warnings = extract_document_resources(file, input_directory)
             else:
                 extracted, warnings = extract_resources(file, input_directory)
         except UnicodeDecodeError:
@@ -272,10 +337,15 @@ def import_resources(files: list[Path], input_directory: Path) -> tuple[list[Res
         except (csv.Error, json.JSONDecodeError, ValueError):
             reports.append(FileReport(source_path, "Review", "Malformed structured data; no resources published."))
             continue
+        except (zipfile.BadZipFile, KeyError, ElementTree.ParseError):
+            reports.append(FileReport(source_path, "Review", "Unreadable document; no resources published."))
+            continue
         resources.extend(extracted)
         reports.extend(warnings)
         if extracted:
             reports.append(FileReport(source_path, "Published", f"Published {len(extracted)} resource(s)."))
+        elif suffix in DOCUMENT_EXTENSIONS:
+            reports.append(FileReport(source_path, "Review", "No extractable document resource entries found."))
         else:
             reports.append(FileReport(source_path, "Review", "No supported resource entries found."))
     reports.extend(duplicate_reports(resources))

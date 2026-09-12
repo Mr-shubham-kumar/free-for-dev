@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -209,3 +210,29 @@ class BuildContractTests(unittest.TestCase):
             )
             self.assertIn("broken.json", report)
             self.assertIn("Malformed structured data", report)
+
+    def test_build_publishes_extractable_docx_and_pdf_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            document_xml = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>DOCX Host | https://docx.example | DOCX hosting</w:t></w:r></w:p></w:body></w:document>"""
+            with zipfile.ZipFile(input_directory / "services.docx", "w") as document:
+                document.writestr("word/document.xml", document_xml)
+            (input_directory / "services.pdf").write_bytes(
+                b"%PDF-1.4\n(PDF Host | https://pdf.example | PDF hosting) Tj\n"
+            )
+            (input_directory / "unreadable.pdf").write_bytes(b"not a text PDF")
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Published: 2 resources", result.stdout)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("DOCX Host", index)
+            self.assertIn("PDF Host", index)
+            report = (workspace / "output" / "reports" / "ingestion-report.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("unreadable.pdf", report)
+            self.assertIn("No extractable document resource entries found", report)
