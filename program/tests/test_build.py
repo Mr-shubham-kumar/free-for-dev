@@ -75,3 +75,47 @@ class BuildContractTests(unittest.TestCase):
             )
             self.assertIn("research.bin", report)
             self.assertIn("Skipped", report)
+
+    def test_build_publishes_markdown_resources_with_source_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "research.md").write_text(
+                "## Hosting\n\n- [Example Host](https://host.example) - Static hosting.\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Published: 1 resources", result.stdout)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("Example Host", index)
+            self.assertIn("Static hosting.", index)
+            detail_pages = list((workspace / "output" / "resources").glob("*.html"))
+            self.assertEqual(len(detail_pages), 1)
+            detail = detail_pages[0].read_text(encoding="utf-8")
+            self.assertIn("Example Host", detail)
+            self.assertIn("Source: research.md:3", detail)
+
+    def test_build_publishes_pipe_delimited_plain_text_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "research.txt").write_text(
+                "Text Host | https://text-host.example | Plain-text hosting.\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("Text Host", index)
+            self.assertIn("Plain-text hosting.", index)
+            detail = next((workspace / "output" / "resources").glob("*.html")).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Source: research.txt:1", detail)

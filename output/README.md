@@ -6,7 +6,7 @@ Open `index.html` in a modern browser.
 
 ## Deploy
 
-Upload the complete contents of this folder to any static hosting provider. Do not upload only `index.html`; `assets/` and `reports/` are required.
+Upload the complete contents of this folder to any static hosting provider. Do not upload only `index.html`; `assets/`, `resources/`, and `reports/` are required.
 
 ## Build summary
 
