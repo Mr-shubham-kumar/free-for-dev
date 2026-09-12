@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import html
 import json
@@ -14,7 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
+TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+STRUCTURED_EXTENSIONS = {".csv", ".json", ".yaml", ".yml"}
+SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | STRUCTURED_EXTENSIONS
 HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 MARKDOWN_RESOURCE_PATTERN = re.compile(
     r"^\s*(?:[-*+]|\d+[.)])\s+\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:[-–—:]\s*)?(.*)$"
@@ -84,6 +87,97 @@ def resource_identifier(name: str, source_path: str, source_line: int) -> str:
 
 def extract_tags(description: str) -> tuple[str, ...]:
     return tuple(sorted({match.group(1).lower() for match in re.finditer(r"(?<!\w)#([a-zA-Z0-9-]+)", description)}))
+
+
+def structured_tags(value: object) -> tuple[str, ...]:
+    if isinstance(value, list):
+        values = value
+    else:
+        values = str(value or "").strip("[]").split(",")
+    return tuple(sorted({str(tag).strip().lstrip("#").lower() for tag in values if str(tag).strip()}))
+
+
+def first_value(record: dict[str, object], *names: str) -> object:
+    lowered = {str(key).lower(): value for key, value in record.items()}
+    for name in names:
+        if name in lowered:
+            return lowered[name]
+    return ""
+
+
+def yaml_records(text: str) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if current is not None:
+                records.append(current)
+            current = {}
+            stripped = stripped[2:].strip()
+        if current is None or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = value.strip().strip("\"'")
+    if current is not None:
+        records.append(current)
+    return records
+
+
+def structured_records(file: Path) -> list[dict[str, object]]:
+    suffix = file.suffix.lower()
+    if suffix == ".csv":
+        with file.open(encoding="utf-8", newline="") as source:
+            return [dict(record) for record in csv.DictReader(source)]
+    if suffix == ".json":
+        decoded = json.loads(file.read_text(encoding="utf-8"))
+        if isinstance(decoded, dict):
+            decoded = decoded.get("resources", decoded.get("items", []))
+        if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+            raise ValueError("JSON must contain a list of resource objects.")
+        return decoded
+    return yaml_records(file.read_text(encoding="utf-8"))
+
+
+def extract_structured_resources(
+    file: Path, input_directory: Path
+) -> tuple[list[Resource], list[FileReport]]:
+    source_path = str(file.relative_to(input_directory)).replace("\\", "/")
+    resources: list[Resource] = []
+    warnings: list[FileReport] = []
+    for line_number, record in enumerate(structured_records(file), start=1):
+        location = f"{source_path}:{line_number}"
+        name = str(first_value(record, "name", "title")).strip()
+        candidate_url = str(first_value(record, "url", "link")).strip()
+        description = str(first_value(record, "description", "summary")).strip()
+        category = str(first_value(record, "category")).strip() or "Uncategorized"
+        if not name:
+            warnings.append(FileReport(location, "Review", "Missing resource name; not published."))
+            continue
+        url = safe_url(candidate_url)
+        if not url:
+            warnings.append(FileReport(location, "Review", "Unsafe or invalid URL; not published."))
+            continue
+        if not description:
+            warnings.append(FileReport(location, "Review", "Missing description."))
+        if category == "Uncategorized":
+            warnings.append(FileReport(location, "Review", "Ambiguous classification: no category."))
+        tags = tuple(sorted(set(extract_tags(description)) | set(structured_tags(first_value(record, "tags")))))
+        resources.append(
+            Resource(
+                identifier=resource_identifier(name, source_path, line_number),
+                name=name,
+                url=url,
+                description=description,
+                category=category,
+                tags=tags,
+                source_path=source_path,
+                source_line=line_number,
+            )
+        )
+    return resources, warnings
 
 
 def extract_resources(file: Path, input_directory: Path) -> tuple[list[Resource], list[FileReport]]:
@@ -163,13 +257,20 @@ def import_resources(files: list[Path], input_directory: Path) -> tuple[list[Res
     reports: list[FileReport] = []
     for file in files:
         source_path = str(file.relative_to(input_directory)).replace("\\", "/")
-        if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        suffix = file.suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
             reports.append(FileReport(source_path, "Skipped", "Unsupported file type."))
             continue
         try:
-            extracted, warnings = extract_resources(file, input_directory)
+            if suffix in STRUCTURED_EXTENSIONS:
+                extracted, warnings = extract_structured_resources(file, input_directory)
+            else:
+                extracted, warnings = extract_resources(file, input_directory)
         except UnicodeDecodeError:
             reports.append(FileReport(source_path, "Skipped", "File is not readable text."))
+            continue
+        except (csv.Error, json.JSONDecodeError, ValueError):
+            reports.append(FileReport(source_path, "Review", "Malformed structured data; no resources published."))
             continue
         resources.extend(extracted)
         reports.extend(warnings)

@@ -173,3 +173,39 @@ class BuildContractTests(unittest.TestCase):
             index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
             self.assertIn("Valid", index)
             self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", index)
+
+    def test_build_publishes_csv_json_and_yaml_resources_from_nested_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input" / "structured"
+            input_directory.mkdir(parents=True)
+            (input_directory / "services.csv").write_text(
+                "name,url,description,category,tags\nCSV Host,https://csv.example,CSV hosting,Hosting,frontend\n",
+                encoding="utf-8",
+            )
+            (input_directory / "services.json").write_text(
+                '[{"name":"JSON Host","url":"https://json.example","description":"JSON hosting","category":"Hosting","tags":["backend"]}]',
+                encoding="utf-8",
+            )
+            (input_directory / "services.yaml").write_text(
+                "- name: YAML Host\n  url: https://yaml.example\n  description: YAML hosting\n  category: Hosting\n  tags: docs\n",
+                encoding="utf-8",
+            )
+            (input_directory / "broken.json").write_text("{not valid json", encoding="utf-8")
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Published: 3 resources", result.stdout)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("CSV Host", index)
+            self.assertIn("JSON Host", index)
+            self.assertIn("YAML Host", index)
+            self.assertIn("frontend", index)
+            self.assertIn("backend", index)
+            self.assertIn("docs", index)
+            report = (workspace / "output" / "reports" / "ingestion-report.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("broken.json", report)
+            self.assertIn("Malformed structured data", report)
