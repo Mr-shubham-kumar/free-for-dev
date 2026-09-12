@@ -143,3 +143,33 @@ class BuildContractTests(unittest.TestCase):
             self.assertIn("frontend", index)
             self.assertIn('src="assets/directory.js"', index)
             self.assertIn("Example Host", script)
+
+    def test_build_reports_invalid_unsafe_and_duplicate_resources_without_hiding_valid_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "research.md").write_text(
+                "## Hosting\n\n"
+                "- [Valid](https://host.example) - A valid resource.\n"
+                "- [Duplicate](https://host.example/) - A duplicate resource.\n"
+                "- [Unsafe](javascript:alert) - Unsafe URL.\n"
+                "- [](https://missing-name.example) - Missing name.\n"
+                "- [Markup](https://markup.example) - <script>unsafe</script>.\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Published: 3 resources", result.stdout)
+            report = (workspace / "output" / "reports" / "ingestion-report.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Duplicate candidate", report)
+            self.assertIn("Unsafe or invalid URL", report)
+            self.assertIn("Missing resource name", report)
+            self.assertIn("Potentially unsafe markup", report)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("Valid", index)
+            self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", index)

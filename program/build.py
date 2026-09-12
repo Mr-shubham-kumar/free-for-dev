@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
 HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 MARKDOWN_RESOURCE_PATTERN = re.compile(
-    r"^\s*(?:[-*+]|\d+[.)])\s+\[([^\]]+)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:[-–—:]\s*)?(.*)$"
+    r"^\s*(?:[-*+]|\d+[.)])\s+\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:[-–—:]\s*)?(.*)$"
 )
 TEXT_RESOURCE_PATTERN = re.compile(r"^\s*([^|]+?)\s*\|\s*(https?://[^|\s]+)\s*(?:\|\s*(.*))?$")
 
@@ -86,10 +86,11 @@ def extract_tags(description: str) -> tuple[str, ...]:
     return tuple(sorted({match.group(1).lower() for match in re.finditer(r"(?<!\w)#([a-zA-Z0-9-]+)", description)}))
 
 
-def extract_resources(file: Path, input_directory: Path) -> list[Resource]:
+def extract_resources(file: Path, input_directory: Path) -> tuple[list[Resource], list[FileReport]]:
     source_path = str(file.relative_to(input_directory)).replace("\\", "/")
     category = "Uncategorized"
     resources: list[Resource] = []
+    warnings: list[FileReport] = []
 
     for line_number, line in enumerate(file.read_text(encoding="utf-8").splitlines(), start=1):
         heading = HEADING_PATTERN.match(line)
@@ -104,9 +105,20 @@ def extract_resources(file: Path, input_directory: Path) -> list[Resource]:
             continue
 
         name, candidate_url, description = (part.strip() for part in match.groups(default=""))
-        url = safe_url(candidate_url)
-        if not name or not url:
+        location = f"{source_path}:{line_number}"
+        if not name:
+            warnings.append(FileReport(location, "Review", "Missing resource name; not published."))
             continue
+        url = safe_url(candidate_url)
+        if not url:
+            warnings.append(FileReport(location, "Review", "Unsafe or invalid URL; not published."))
+            continue
+        if not description:
+            warnings.append(FileReport(location, "Review", "Missing description."))
+        if category == "Uncategorized":
+            warnings.append(FileReport(location, "Review", "Ambiguous classification: no heading category."))
+        if re.search(r"<[^>]+>", f"{name} {description}"):
+            warnings.append(FileReport(location, "Review", "Potentially unsafe markup was escaped."))
         resources.append(
             Resource(
                 identifier=resource_identifier(name, source_path, line_number),
@@ -120,7 +132,30 @@ def extract_resources(file: Path, input_directory: Path) -> list[Resource]:
             )
         )
 
-    return resources
+    return resources, warnings
+
+
+def canonical_url(value: str) -> str:
+    parsed = urlparse(value)
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}?{parsed.query}"
+
+
+def duplicate_reports(resources: list[Resource]) -> list[FileReport]:
+    first_by_url: dict[str, Resource] = {}
+    reports: list[FileReport] = []
+    for resource in resources:
+        key = canonical_url(resource.url)
+        first = first_by_url.setdefault(key, resource)
+        if first is not resource:
+            reports.append(
+                FileReport(
+                    f"{resource.source_path}:{resource.source_line}",
+                    "Review",
+                    f"Duplicate candidate of {first.source_path}:{first.source_line}; both sources were retained.",
+                )
+            )
+    return reports
 
 
 def import_resources(files: list[Path], input_directory: Path) -> tuple[list[Resource], list[FileReport]]:
@@ -132,15 +167,17 @@ def import_resources(files: list[Path], input_directory: Path) -> tuple[list[Res
             reports.append(FileReport(source_path, "Skipped", "Unsupported file type."))
             continue
         try:
-            extracted = extract_resources(file, input_directory)
+            extracted, warnings = extract_resources(file, input_directory)
         except UnicodeDecodeError:
             reports.append(FileReport(source_path, "Skipped", "File is not readable text."))
             continue
         resources.extend(extracted)
+        reports.extend(warnings)
         if extracted:
             reports.append(FileReport(source_path, "Published", f"Published {len(extracted)} resource(s)."))
         else:
             reports.append(FileReport(source_path, "Review", "No supported resource entries found."))
+    reports.extend(duplicate_reports(resources))
     return resources, reports
 
 
@@ -179,7 +216,7 @@ def resource_page(resource: Resource) -> str:
 <p class="source">Source: {escaped(resource.source_path)}:{resource.source_line}</p></article></main></body></html>"""
 
 
-def build_report(reports: list[FileReport], published_count: int) -> str:
+def build_report(reports: list[FileReport], published_count: int, processed_count: int) -> str:
     rows = "".join(
         f"<tr><td><code>{escaped(report.source_path)}</code></td><td>{escaped(report.status)}</td><td>{escaped(report.reason)}</td></tr>"
         for report in reports
@@ -191,7 +228,7 @@ def build_report(reports: list[FileReport], published_count: int) -> str:
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ingestion report</title><link rel="stylesheet" href="../assets/site.css"></head>
 <body><main><p><a href="../index.html">← Directory</a></p><h1>Ingestion report</h1>
-<p>Processed: {len(reports)} files. Published: {published_count} resources. Skipped: {skipped_count} files.</p>
+<p>Processed: {processed_count} files. Published: {published_count} resources. Skipped: {skipped_count} files.</p>
 <table><thead><tr><th>Input file</th><th>Status</th><th>Reason</th></tr></thead><tbody>{rows}</tbody></table>
 </main></body></html>"""
 
@@ -214,7 +251,9 @@ def select_options(values: list[str], label: str) -> str:
     return "".join(f'<option value="{escaped(value)}">{escaped(label)}: {escaped(value)}</option>' for value in values)
 
 
-def build_site(temporary_output: Path, resources: list[Resource], reports: list[FileReport]) -> None:
+def build_site(
+    temporary_output: Path, resources: list[Resource], reports: list[FileReport], processed_count: int
+) -> None:
     cards = "".join(resource_card(resource) for resource in resources)
     directory_content = cards or "<p>No resources have been imported yet.</p>"
     categories = sorted({resource.category for resource in resources})
@@ -263,7 +302,10 @@ applyFilters();
     )
     for resource in resources:
         write_file(temporary_output / "resources" / f"{resource.identifier}.html", resource_page(resource))
-    write_file(temporary_output / "reports" / "ingestion-report.html", build_report(reports, len(resources)))
+    write_file(
+        temporary_output / "reports" / "ingestion-report.html",
+        build_report(reports, len(resources), processed_count),
+    )
     skipped_count = sum(report.status == "Skipped" for report in reports)
     write_file(
         temporary_output / "README.md",
@@ -279,7 +321,7 @@ Upload the complete contents of this folder to any static hosting provider. Do n
 
 ## Build summary
 
-- Sources processed: {len(reports)}
+- Sources processed: {processed_count}
 - Resources published: {len(resources)}
 - Files skipped: {skipped_count}
 
@@ -290,12 +332,14 @@ Open `reports/ingestion-report.html`.
     )
 
 
-def replace_output(root: Path, resources: list[Resource], reports: list[FileReport]) -> None:
+def replace_output(
+    root: Path, resources: list[Resource], reports: list[FileReport], processed_count: int
+) -> None:
     output_directory = root / "output"
     with tempfile.TemporaryDirectory(dir=root, prefix=".output-") as temporary_directory:
         temporary_output = Path(temporary_directory) / "output"
         temporary_output.mkdir()
-        build_site(temporary_output, resources, reports)
+        build_site(temporary_output, resources, reports, processed_count)
 
         backup_directory = root / ".output-previous"
         if backup_directory.exists():
@@ -312,7 +356,7 @@ def main() -> int:
     input_directory = root / "input"
     files = discover_files(input_directory)
     resources, reports = import_resources(files, input_directory)
-    replace_output(root, resources, reports)
+    replace_output(root, resources, reports, len(files))
     skipped_count = sum(report.status == "Skipped" for report in reports)
     print(f"Processed: {len(files)} files")
     print(f"Published: {len(resources)} resources")
