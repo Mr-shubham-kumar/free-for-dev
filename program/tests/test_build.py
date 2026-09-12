@@ -146,7 +146,9 @@ class BuildContractTests(unittest.TestCase):
             self.assertIn("Hosting", index)
             self.assertIn("frontend", index)
             self.assertIn('src="assets/directory.js"', index)
+            self.assertIn('id="theme-toggle"', index)
             self.assertIn("Example Host", script)
+            self.assertIn("theme-toggle", script)
 
     def test_build_reports_invalid_unsafe_and_duplicate_resources_without_hiding_valid_ones(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
