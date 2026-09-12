@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -9,6 +11,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BUILD_COMMAND = PROJECT_ROOT / "program" / "build.py"
+FIXTURE_INPUT = PROJECT_ROOT / "program" / "tests" / "fixtures" / "mixed-input"
 
 
 class BuildContractTests(unittest.TestCase):
@@ -236,3 +239,88 @@ class BuildContractTests(unittest.TestCase):
             )
             self.assertIn("unreadable.pdf", report)
             self.assertIn("No extractable document resource entries found", report)
+
+    def test_generated_search_filters_results_in_a_headless_browser(self) -> None:
+        browser_binary = os.environ.get("BROWSER_BINARY")
+        if not browser_binary:
+            self.skipTest("Set BROWSER_BINARY to run the headless-browser contract test.")
+        browser = Path(browser_binary)
+        if not browser.exists():
+            self.skipTest("BROWSER_BINARY does not point to a browser executable.")
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "search.md").write_text(
+                "## Hosting\n\n- [Alpha Host](https://alpha.example) - Alpha service.\n- [Beta Host](https://beta.example) - Beta service.\n",
+                encoding="utf-8",
+            )
+            build = self.run_build(workspace)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            index_url = (workspace / "output" / "index.html").as_uri() + "?q=alpha"
+
+            browser_result = subprocess.run(
+                [
+                    str(browser),
+                    "--headless",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--virtual-time-budget=1000",
+                    "--dump-dom",
+                    f"--user-data-dir={workspace / 'browser-profile'}",
+                    index_url,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(browser_result.returncode, 0, browser_result.stderr)
+            self.assertIn("1 resource shown", browser_result.stdout)
+            self.assertIn('data-resource-id="beta-host-', browser_result.stdout)
+            self.assertIn("hidden", browser_result.stdout)
+
+    def test_build_handles_a_mixed_fixture_tree_and_rebuilds_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            shutil.copytree(FIXTURE_INPUT, input_directory)
+            original_sources = {
+                path.relative_to(input_directory): path.read_bytes()
+                for path in input_directory.rglob("*")
+                if path.is_file()
+            }
+
+            first_build = self.run_build(workspace)
+
+            self.assertEqual(first_build.returncode, 0, first_build.stderr)
+            self.assertIn("Processed: 3 files", first_build.stdout)
+            self.assertIn("Published: 3 resources", first_build.stdout)
+            report = (workspace / "output" / "reports" / "ingestion-report.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Duplicate candidate", report)
+            self.assertIn("Unsafe or invalid URL", report)
+            self.assertIn("Unsupported file type", report)
+            self.assertEqual(
+                original_sources,
+                {
+                    path.relative_to(input_directory): path.read_bytes()
+                    for path in input_directory.rglob("*")
+                    if path.is_file()
+                },
+            )
+            old_detail_pages = list((workspace / "output" / "resources").glob("*.html"))
+            self.assertEqual(len(old_detail_pages), 3)
+
+            shutil.rmtree(input_directory)
+            input_directory.mkdir()
+            second_build = self.run_build(workspace)
+
+            self.assertEqual(second_build.returncode, 0, second_build.stderr)
+            self.assertFalse((workspace / "output" / "resources").exists())
+            self.assertIn(
+                "No resources have been imported yet.",
+                (workspace / "output" / "index.html").read_text(encoding="utf-8"),
+            )
