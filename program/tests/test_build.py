@@ -152,6 +152,26 @@ class BuildContractTests(unittest.TestCase):
             self.assertIn('class="node-label"', index)
             self.assertIn('class="card-actions"', index)
 
+    def test_build_generates_insights_from_shared_cross_category_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "connections.md").write_text(
+                "## Hosting\n\n- [Host Signal](https://host.example) - Deploy with #automation.\n\n"
+                "## Monitoring\n\n- [Monitor Signal](https://monitor.example) - Observe with #automation.\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            insights = (workspace / "output" / "insights.html").read_text(encoding="utf-8")
+            self.assertIn("Unexpected connections", insights)
+            self.assertIn("automation", insights)
+            self.assertIn("Hosting", insights)
+            self.assertIn("Monitoring", insights)
+
     def test_build_reports_invalid_unsafe_and_duplicate_resources_without_hiding_valid_ones(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             workspace = Path(temp_directory)
