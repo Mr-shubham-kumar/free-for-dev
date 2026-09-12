@@ -119,3 +119,27 @@ class BuildContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("Source: research.txt:1", detail)
+
+    def test_build_generates_accessible_search_and_reliable_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace = Path(temp_directory)
+            input_directory = workspace / "input"
+            input_directory.mkdir()
+            (input_directory / "research.md").write_text(
+                "## Hosting\n\n- [Example Host](https://host.example) - Static hosting for #frontend.\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_build(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            index = (workspace / "output" / "index.html").read_text(encoding="utf-8")
+            script = (workspace / "output" / "assets" / "directory.js").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('role="search"', index)
+            self.assertIn('aria-label="Search resources"', index)
+            self.assertIn("Hosting", index)
+            self.assertIn("frontend", index)
+            self.assertIn('src="assets/directory.js"', index)
+            self.assertIn("Example Host", script)

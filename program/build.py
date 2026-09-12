@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import json
 import re
 import shutil
 import tempfile
@@ -28,6 +29,7 @@ class Resource:
     url: str
     description: str
     category: str
+    tags: tuple[str, ...]
     source_path: str
     source_line: int
 
@@ -80,6 +82,10 @@ def resource_identifier(name: str, source_path: str, source_line: int) -> str:
     return f"{slugify(name)}-{hashlib.sha256(seed).hexdigest()[:8]}"
 
 
+def extract_tags(description: str) -> tuple[str, ...]:
+    return tuple(sorted({match.group(1).lower() for match in re.finditer(r"(?<!\w)#([a-zA-Z0-9-]+)", description)}))
+
+
 def extract_resources(file: Path, input_directory: Path) -> list[Resource]:
     source_path = str(file.relative_to(input_directory)).replace("\\", "/")
     category = "Uncategorized"
@@ -108,6 +114,7 @@ def extract_resources(file: Path, input_directory: Path) -> list[Resource]:
                 url=url,
                 description=description,
                 category=category,
+                tags=extract_tags(description),
                 source_path=source_path,
                 source_line=line_number,
             )
@@ -146,11 +153,17 @@ def escaped(value: str) -> str:
     return html.escape(value, quote=True)
 
 
+def tag_list(resource: Resource) -> str:
+    if not resource.tags:
+        return ""
+    return "<ul class=\"tags\">" + "".join(f"<li>{escaped(tag)}</li>" for tag in resource.tags) + "</ul>"
+
+
 def resource_card(resource: Resource) -> str:
     description = f"<p>{escaped(resource.description)}</p>" if resource.description else ""
-    return f"""<article class="resource-card">
+    return f"""<article class="resource-card" data-resource-id="{escaped(resource.identifier)}">
 <h2><a href="resources/{escaped(resource.identifier)}.html">{escaped(resource.name)}</a></h2>
-<p class="category">{escaped(resource.category)}</p>{description}
+<p class="category">{escaped(resource.category)}</p>{tag_list(resource)}{description}
 <p class="source">Source: {escaped(resource.source_path)}:{resource.source_line}</p>
 </article>"""
 
@@ -161,7 +174,7 @@ def resource_page(resource: Resource) -> str:
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escaped(resource.name)} · Research Directory</title><link rel="stylesheet" href="../assets/site.css"></head>
 <body><main><p><a href="../index.html">← Directory</a></p><article><h1>{escaped(resource.name)}</h1>
-<p class="category">{escaped(resource.category)}</p>{description}
+<p class="category">{escaped(resource.category)}</p>{tag_list(resource)}{description}
 <p><a href="{escaped(resource.url)}" rel="noopener noreferrer">Visit resource</a></p>
 <p class="source">Source: {escaped(resource.source_path)}:{resource.source_line}</p></article></main></body></html>"""
 
@@ -183,19 +196,70 @@ def build_report(reports: list[FileReport], published_count: int) -> str:
 </main></body></html>"""
 
 
+def search_records(resources: list[Resource]) -> str:
+    records = [
+        {
+            "id": resource.identifier,
+            "name": resource.name,
+            "description": resource.description,
+            "category": resource.category,
+            "tags": list(resource.tags),
+        }
+        for resource in resources
+    ]
+    return json.dumps(records, ensure_ascii=False).replace("<", "\\u003c")
+
+
+def select_options(values: list[str], label: str) -> str:
+    return "".join(f'<option value="{escaped(value)}">{escaped(label)}: {escaped(value)}</option>' for value in values)
+
+
 def build_site(temporary_output: Path, resources: list[Resource], reports: list[FileReport]) -> None:
     cards = "".join(resource_card(resource) for resource in resources)
     directory_content = cards or "<p>No resources have been imported yet.</p>"
+    categories = sorted({resource.category for resource in resources})
+    tags = sorted({tag for resource in resources for tag in resource.tags})
     write_file(
         temporary_output / "index.html",
         f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Research Directory</title><link rel="stylesheet" href="assets/site.css"></head>
-<body><main><h1>Research Directory</h1><p>Your portable directory is ready.</p><section aria-label="Resources">{directory_content}</section><p><a href="reports/ingestion-report.html">View ingestion report</a></p></main></body></html>""",
+<body><main><h1>Research Directory</h1><p>Your portable directory is ready.</p>
+<form role="search" class="filters"><label for="search">Search resources</label><input id="search" type="search" aria-label="Search resources" autocomplete="off"><label for="category">Category</label><select id="category"><option value="">All categories</option>{select_options(categories, "Category")}</select><label for="tag">Tag</label><select id="tag"><option value="">All tags</option>{select_options(tags, "Tag")}</select></form>
+<p id="result-count" aria-live="polite"></p><section aria-label="Resources">{directory_content}</section><p><a href="reports/ingestion-report.html">View ingestion report</a></p></main><script src="assets/directory.js"></script></body></html>""",
     )
     write_file(
         temporary_output / "assets" / "site.css",
-        """body { background: #f8fafc; color: #172033; font-family: system-ui, sans-serif; line-height: 1.5; margin: 0; } main { margin: 0 auto; max-width: 72rem; padding: 2rem; } a { color: #155eef; } .resource-card { background: white; border: 1px solid #d0d5dd; border-radius: .5rem; margin: 1rem 0; padding: 1rem; } .resource-card h2 { margin-top: 0; } .category, .source { color: #475467; } table { background: white; border-collapse: collapse; width: 100%; } th, td { border: 1px solid #d0d5dd; padding: .75rem; text-align: left; }""",
+        """body { background: #f8fafc; color: #172033; font-family: system-ui, sans-serif; line-height: 1.5; margin: 0; } main { margin: 0 auto; max-width: 72rem; padding: 2rem; } a { color: #155eef; } .filters { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); } input, select { font: inherit; padding: .5rem; } .resource-card { background: white; border: 1px solid #d0d5dd; border-radius: .5rem; margin: 1rem 0; padding: 1rem; } .resource-card h2 { margin-top: 0; } .category, .source { color: #475467; } .tags { display: flex; flex-wrap: wrap; gap: .5rem; list-style: none; padding: 0; } .tags li { background: #e0eaff; border-radius: 1rem; padding: .125rem .5rem; } table { background: white; border-collapse: collapse; width: 100%; } th, td { border: 1px solid #d0d5dd; padding: .75rem; text-align: left; }""",
+    )
+    write_file(
+        temporary_output / "assets" / "directory.js",
+        f"""const resources = {search_records(resources)};
+const search = document.querySelector('#search');
+const category = document.querySelector('#category');
+const tag = document.querySelector('#tag');
+const count = document.querySelector('#result-count');
+const parameters = new URLSearchParams(window.location.search);
+search.value = parameters.get('q') || '';
+category.value = parameters.get('category') || '';
+tag.value = parameters.get('tag') || '';
+function applyFilters() {{
+  const query = search.value.trim().toLowerCase();
+  let visible = 0;
+  for (const resource of resources) {{
+    const searchable = [resource.name, resource.description, resource.category, ...resource.tags].join(' ').toLowerCase();
+    const matches = (!query || searchable.includes(query)) && (!category.value || resource.category === category.value) && (!tag.value || resource.tags.includes(tag.value));
+    document.querySelector(`[data-resource-id="${{resource.id}}"]`).hidden = !matches;
+    if (matches) visible += 1;
+  }}
+  count.textContent = `${{visible}} resource${{visible === 1 ? '' : 's'}} shown`;
+}}
+for (const control of [search, category, tag]) {{
+  control.addEventListener('input', applyFilters);
+  control.addEventListener('change', applyFilters);
+}}
+applyFilters();
+""",
     )
     for resource in resources:
         write_file(temporary_output / "resources" / f"{resource.identifier}.html", resource_page(resource))
